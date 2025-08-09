@@ -1,4 +1,4 @@
-﻿import os, json, argparse, requests
+import os, json, argparse, requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,7 +39,7 @@ def main():
     if not API_KEY:
         raise SystemExit("Missing RUNPOD_API_KEY")
 
-    with open(args.config, "r", encoding="utf-8") as f:
+    with open(args.config, "r", encoding="utf-8-sig") as f:
         body = json.load(f)
 
     if args.name:
