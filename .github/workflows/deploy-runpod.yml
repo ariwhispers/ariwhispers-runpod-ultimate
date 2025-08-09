@@ -1,4 +1,5 @@
-name: deploy-runpod
+﻿name: deploy-runpod
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,10 +13,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - run: pip install -r requirements.txt
+
+      # Debug: prove the file exists and has content on the runner
+      - name: Debug pod_config.json
+        run: |
+          set -x
+          ls -la infra/runpod || true
+          wc -c infra/runpod/pod_config.json || true
+          sed -n '1,120p' infra/runpod/pod_config.json || true
+
       - name: Launch or update pod
         env:
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
