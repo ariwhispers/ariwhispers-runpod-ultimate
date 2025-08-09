@@ -1,17 +1,19 @@
-{
-  "image": "runpod/pytorch:2.3.0-py3.10-cuda12.1",
-  "gpuTypeId": "NVIDIA GeForce RTX 4090",
-  "minVcpuCount": 8,
-  "minMemoryInGiB": 30,
-  "volumeInGiB": 40,
-  "containerDiskInGiB": 20,
-  "ports": ["7860/http", "8000/http"],
+﻿{
+  "name": "ari-ultimate",
+  "cloudType": "SECURE",
+  "regionId": "US-KS-2",
+  "gpuTypeId": "NVIDIA_L40",
+  "gpuCount": 1,
+  "minVcpuCount": 16,
+  "minMemoryInGb": 250,
+  "containerDiskInGb": 100,
+  "volumeInGb": 200,
+  "volumeMountPath": "/workspace",
+  "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
+  "ports": "11434,8188,8888,5000,7680",
+  "tcpPorts": "22",
   "env": {
-    "HUGGINGFACE_TOKEN": "${{ secrets.HUGGINGFACE_TOKEN }}",
-    "ELEVENLABS_API_KEY": "${{ secrets.ELEVENLABS_API_KEY }}",
-    "GEMINI_API_KEY": "${{ secrets.GEMINI_API_KEY }}"
-  },
-  "templateId": null,
-  "name": null,
-  "readmeUrl": null
+    "PUBLIC_KEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDTP4We8uNhdHo0DODXleWjOCbG6LgikEKzMez9+s7vT ariwhispers1@gmail.com",
+    "JUPYTER_PASSWORD": "b2fzhn4whpgcno0xedv4"
+  }
 }
