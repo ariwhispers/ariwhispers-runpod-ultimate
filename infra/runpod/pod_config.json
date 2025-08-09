@@ -1,1 +1,6 @@
-<PASTE THE JSON ABOVE HERE>
+- name: Debug pod_config.json
+  run: |
+    set -x
+    ls -la infra/runpod || true
+    wc -c infra/runpod/pod_config.json || true
+    sed -n '1,120p' infra/runpod/pod_config.json || true
