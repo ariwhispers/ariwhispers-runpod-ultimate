@@ -1,291 +1,350 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Upsert a RunPod pod by name:
-- If a pod with the given name exists -> PATCH it with the config.
-- If it doesn't exist -> POST to create it.
-- Prints a GitHub Actions notice like: ::notice title=RunPod::POD_ID=...
+Launch or update a RunPod pod (best-effort upsert by name), optionally wait
+until it's running, optionally check exposed ports, and emit POD_ID for workflows.
 
-Expects:
-  - ENV: RUNPOD_API_KEY
-  - Config JSON: infra/runpod/pod_config.json (default), or pass --config
+This script is defensive: RunPod's v2 REST surface may differ by account/region.
+We try name-lookup first; if the API returns 404 for list/search endpoints,
+we fall back to creation. If creation conflicts (name already exists), we try
+to discover the pod ID via other endpoints before giving up.
 
-You can override the name with --name.
+Environment:
+  RUNPOD_API_KEY      (required)
+  RUNPOD_API_BASE     (optional, default: https://api.runpod.io)
+  GITHUB_OUTPUT       (GitHub Actions sets this; used to emit POD_ID)
+
+CLI:
+  --name NAME
+  --wait-ready SECONDS         (default: 0 -> don't wait)
+  --check-ports true|false     (default: false)
+  --idle-minutes MINUTES       (default: 0 -> disabled)
+
+Config file:
+  infra/runpod/pod_config.json  (base pod spec; we inject/override .name and may
+                                append env vars / hints like IDLE_MINUTES)
 """
-
 from __future__ import annotations
 
 import argparse
 import json
 import os
 import sys
-import textwrap
+import time
+import socket
 from typing import Any, Dict, Optional
 
 import requests
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
+CONFIG_PATH = os.path.join(HERE, "pod_config.json")
 
-BASE_URL = "https://api.runpod.io/v2"
-CONFIG_PATH_DEFAULT = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "runpod",
-    "pod_config.json",
-)
-TIMEOUT = 30
-
-
-def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+DEFAULT_API_BASE = os.environ.get("RUNPOD_API_BASE", "https://api.runpod.io").rstrip("/")
+API_TIMEOUT = 30
+SESSION = requests.Session()
 
 
-def api(
-    method: str,
-    path: str,
-    token: str,
-    json_body: Optional[Dict[str, Any]] = None,
-    timeout: int = TIMEOUT,
-) -> requests.Response:
-    """
-    Simple API wrapper that raises for HTTP >=400.
-    NOTE: Use raw requests.* in places where we want to ignore 404s.
-    """
-    url = f"{BASE_URL.rstrip('/')}/{path.lstrip('/')}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    r = requests.request(method.upper(), url, headers=headers, json=json_body, timeout=timeout)
-    if r.status_code >= 400:
-        # Print a compact error context to stderr to aid debugging in CI logs.
-        snippet = None
-        try:
-            snippet = r.json()
-        except Exception:
-            snippet = r.text
-        eprint(f"[launch_pod] ERROR: {method.upper()} {path} -> {r.status_code}: {snippet}")
-        r.raise_for_status()
-    return r
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
 
-def load_pod_config(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Config file not found: {path}")
-    with open(path, "r", encoding="utf-8-sig") as f:
-        text = f.read().strip()
-    if not text:
-        raise RuntimeError(f"Config file is empty: {path}")
+def debug(errprefix: str, e: requests.RequestException, resp: Optional[requests.Response]) -> None:
     try:
-        data = json.loads(text)
-    except Exception as e:
-        eprint(f"[launch_pod] ERROR: Invalid JSON in {path}: {e}")
-        raise RuntimeError(f"Invalid JSON in {path}: {e}") from e
-    if not isinstance(data, dict):
-        raise RuntimeError(f"Config root must be an object: {path}")
-    return data
+        body = resp.json() if resp is not None else None
+    except Exception:
+        body = resp.text if resp is not None else None
+    log(f"[launch_pod] {errprefix}: {str(e)}; response={body}")
 
 
-def redact_env_in_body(body: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Return a shallow copy with env values masked for logging.
-    """
-    copy = dict(body)
-    env = copy.get("env")
-    if isinstance(env, dict):
-        red = {}
-        for k, v in env.items():
-            sv = str(v)
-            if not sv:
-                red[k] = sv
-                continue
-            if len(sv) <= 8:
-                red[k] = "****"
-            else:
-                red[k] = sv[:2] + "****" + sv[-2:]
-        copy["env"] = red
-    return copy
+def api(method: str, path: str, token: str, **kwargs) -> requests.Response:
+    url = f"{DEFAULT_API_BASE}{path}"
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    headers["Content-Type"] = "application/json"
+    # Don't let requests print secrets on error
+    kwargs.setdefault("timeout", API_TIMEOUT)
+    return SESSION.request(method, url, headers=headers, **kwargs)
 
 
-def print_truncated_request(title: str, body: Dict[str, Any], limit: int = 2000) -> None:
-    red = redact_env_in_body(body)
-    pretty = json.dumps(red, indent=2, ensure_ascii=False)
-    out = pretty if len(pretty) <= limit else (pretty[:limit] + "\n... (truncated)")
-    print(f"{title}\n{out}")
+def read_config() -> Dict[str, Any]:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        # Guard against BOM
+        raw = f.read().lstrip("\ufeff")
+        return json.loads(raw)
+
+
+def merge_env(cfg_env: Dict[str, str], extras: Dict[str, str]) -> Dict[str, str]:
+    out = dict(cfg_env or {})
+    for k, v in extras.items():
+        if v is None or v == "":
+            continue
+        out[k] = v
+    return out
 
 
 def find_pod_by_name(name: str, token: str) -> Optional[Dict[str, Any]]:
     """
-    Try a fast filtered query first; if the endpoint isn't available (404) or
-    doesn't return what we expect, fall back to listing pods and filtering locally.
+    Best-effort search by name.
+    Different accounts may not have a 'GET /v2/pods' or '/v2/pods?name=…'.
+    We try a couple of patterns; any 404s are tolerated.
     """
-    # 1) Fast path – tolerate 404 or parse issues and just fall through.
-    try:
-        r = requests.get(
-            f"{BASE_URL}/pods?name={name}",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            timeout=TIMEOUT,
+    try_paths = [
+        f"/v2/pods?name={name}",
+        "/v2/pods",  # if supported, filter client-side
+    ]
+    for p in try_paths:
+        try:
+            r = api("GET", p, token)
+            if r.status_code == 404:
+                # Endpoint not available in this account/plan — try next
+                log(f"[launch_pod] NOTE: {p} returned 404; trying alternate lookup.")
+                continue
+            r.raise_for_status()
+            data = r.json()
+            # data might be a list or an object with 'data' key depending on API surface
+            pods = []
+            if isinstance(data, list):
+                pods = data
+            elif isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], list):
+                    pods = data["data"]
+                elif "pods" in data and isinstance(data["pods"], list):
+                    pods = data["pods"]
+            for pod in pods:
+                if str(pod.get("name", "")).strip().lower() == name.strip().lower():
+                    return pod
+        except requests.RequestException as e:
+            debug(f"ERROR: GET {p}", e, resp=getattr(e, "response", None))
+            # Continue trying alternatives
+            continue
+    return None
+
+
+def create_pod(spec: Dict[str, Any], token: str) -> Dict[str, Any]:
+    r = api("POST", "/v2/pods", token, json=spec)
+    if r.status_code == 404:
+        # Some tenants expose creation at /v2/pods/create
+        r = api("POST", "/v2/pods/create", token, json=spec)
+    r.raise_for_status()
+    return r.json()
+
+
+def get_pod(pod_id: str, token: str) -> Dict[str, Any]:
+    r = api("GET", f"/v2/pods/{pod_id}", token)
+    r.raise_for_status()
+    return r.json()
+
+
+def update_pod(pod_id: str, spec: Dict[str, Any], token: str) -> Dict[str, Any]:
+    # Some surfaces use PATCH, others PUT — try PATCH then PUT.
+    r = api("PATCH", f"/v2/pods/{pod_id}", token, json=spec)
+    if r.status_code in (404, 405):
+        r = api("PUT", f"/v2/pods/{pod_id}", token, json=spec)
+    r.raise_for_status()
+    return r.json()
+
+
+def wait_until_running(pod_id: str, token: str, timeout_secs: int) -> Dict[str, Any]:
+    if timeout_secs <= 0:
+        return get_pod(pod_id, token)
+    deadline = time.time() + timeout_secs
+    last_state = ""
+    while time.time() < deadline:
+        pod = get_pod(pod_id, token)
+        # Common shapes: { status: { phase: "RUNNING" } } OR { state: "RUNNING" }
+        phase = (
+            pod.get("status", {}).get("phase")
+            or pod.get("status")
+            or pod.get("state")
+            or ""
         )
-        if r.status_code < 400:
-            try:
-                j = r.json()
-            except Exception:
-                j = None
-            items = None
-            if isinstance(j, dict):
-                # Some APIs use { data: [...] } or { pods: [...] }
-                items = j.get("data")
-                if items is None and "pods" in j:
-                    items = j["pods"]
-            elif isinstance(j, list):
-                items = j
+        phase_str = str(phase).upper()
+        if phase_str != last_state:
+            log(f"[launch_pod] pod {pod_id} state: {phase_str}")
+            last_state = phase_str
+        if phase_str in ("RUNNING", "READY", "HEALTHY"):
+            return pod
+        time.sleep(5)
+    raise TimeoutError(f"Timed out waiting for pod {pod_id} to become RUNNING after {timeout_secs}s")
 
-            if isinstance(items, list):
-                for p in items:
-                    if (p.get("name") or "").strip() == name:
-                        return p
-    except Exception:
-        # Network/JSON errors: ignore and try slow path below.
-        pass
 
-    # 2) Slow path – list all and filter locally.
-    r2 = api("GET", "/pods", token)
+def tcp_check(host: str, port: int, timeout: float = 3.0) -> bool:
     try:
-        j2 = r2.json()
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
     except Exception:
-        return None
-
-    items = None
-    if isinstance(j2, dict):
-        items = j2.get("data")
-        if items is None and "pods" in j2:
-            items = j2["pods"]
-    elif isinstance(j2, list):
-        items = j2
-
-    if isinstance(items, list):
-        for p in items:
-            if (p.get("name") or "").strip() == name:
-                return p
-    return None
+        return False
 
 
-def upsert_pod(config: Dict[str, Any], token: str) -> Dict[str, Any]:
+def discover_host_and_ports(pod: Dict[str, Any]) -> tuple[Optional[str], list[int]]:
     """
-    Upsert by name:
-      - Find by name
-      - PATCH if found
-      - POST if not found
-    Returns the final pod object (as returned by the API).
+    Do best-effort discovery. Depending on account, the public address may be under:
+      pod["publicIp"], pod["status"]["network"]["publicIp"], pod["proxy"]["host"], etc.
+    Ports list can come from config "ports" (comma string) — we fall back to that.
     """
-    name = (config.get("name") or "").strip()
-    if not name:
-        raise RuntimeError("Config must include a non-empty 'name'.")
+    host_candidates = [
+        pod.get("publicIp"),
+        pod.get("public_ip"),
+        pod.get("proxy", {}).get("host") if isinstance(pod.get("proxy"), dict) else None,
+        pod.get("status", {}).get("network", {}).get("publicIp")
+        if isinstance(pod.get("status"), dict)
+        else None,
+    ]
+    host = next((h for h in host_candidates if h), None)
 
-    pod = find_pod_by_name(name, token)
-
-    if pod and "id" in pod:
-        pod_id = pod["id"]
-        # Prepare patch body; you can send the same config or selectively update fields.
-        # Here we send the whole config so your updates (env/ports/etc.) apply.
-        print_truncated_request("Final pod request body (truncated to 2000 chars):", config)
-        r = api("PATCH", f"/pods/{pod_id}", token, json_body=config)
+    ports: list[int] = []
+    # Try to find ports array in pod detail
+    if "ports" in pod and isinstance(pod["ports"], list):
         try:
-            return r.json()
+            ports = [int(p) for p in pod["ports"]]
         except Exception:
-            return {"id": pod_id, "name": name, "status": "patched"}
-    else:
-        # Create new pod
-        print_truncated_request("Final pod request body (truncated to 2000 chars):", config)
-        r = api("POST", "/pods", token, json_body=config)
+            pass
+    return host, ports
+
+
+def upsert_pod(cfg: Dict[str, Any], token: str, name: str) -> Dict[str, Any]:
+    """
+    Upsert strategy:
+      1) Try to find by name; if found, send update (PATCH/PUT) with new spec.
+      2) If not found or listing not supported, try create.
+      3) If create conflicts because name exists, attempt another lookup path.
+    """
+    # Ensure name in spec
+    spec = dict(cfg)
+    spec["name"] = name
+
+    # Inject IDLE_MINUTES as an env to your container (your entrypoint can implement it)
+    env = spec.get("env", {})
+    env = merge_env(env, {"IDLE_MINUTES": os.environ.get("IDLE_MINUTES", "")})
+    spec["env"] = env
+
+    found = find_pod_by_name(name, token)
+    if found and "id" in found:
+        pod_id = str(found["id"])
+        log(f"[launch_pod] Updating existing pod '{name}' (id={pod_id})")
+        updated = update_pod(pod_id, spec, token)
+        updated["id"] = updated.get("id", pod_id)  # keep id
+        return updated
+
+    log(f"[launch_pod] Creating pod '{name}' (no existing match found)")
+    try:
+        created = create_pod(spec, token)
+        # Some responses wrap the pod; try to normalize
+        pod_obj = created.get("pod") if isinstance(created, dict) else None
+        if isinstance(pod_obj, dict) and "id" in pod_obj:
+            return pod_obj
+        return created
+    except requests.HTTPError as e:
+        resp = getattr(e, "response", None)
+        status = resp.status_code if resp is not None else None
+        text = ""
         try:
-            return r.json()
+            text = resp.text if resp is not None else ""
         except Exception:
-            # Best effort fallback; the create call should return the pod object with id
-            return {"name": name, "status": "created"}
+            pass
+        if status == 409 or ("exists" in text.lower() if text else False):
+            log(f"[launch_pod] Create reported conflict; trying to re-discover existing pod by name.")
+            existing = find_pod_by_name(name, token)
+            if existing:
+                return existing
+        debug("ERROR: create pod", e, resp)
+        raise
 
 
-def extract_pod_id(pod_obj: Any) -> Optional[str]:
-    """
-    The API may wrap payloads. Try a few common shapes to get the ID.
-    """
-    if not isinstance(pod_obj, (dict,)):
-        return None
-    # direct
-    if "id" in pod_obj and isinstance(pod_obj["id"], str):
-        return pod_obj["id"]
-    # data wrapper
-    data = pod_obj.get("data")
-    if isinstance(data, dict) and isinstance(data.get("id"), str):
-        return data["id"]
-    # nested pod
-    pod = pod_obj.get("pod")
-    if isinstance(pod, dict) and isinstance(pod.get("id"), str):
-        return pod["id"]
-    return None
+def write_github_output(key: str, value: str) -> None:
+    path = os.environ.get("GITHUB_OUTPUT")
+    if not path:
+        # Fallback to print if not in Actions
+        log(f"{key}={value}")
+        return
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(f"{key}={value}\n")
+
+
+def parse_bool(v: str) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Create or update a RunPod pod using infra/runpod/pod_config.json"
-    )
-    parser.add_argument(
-        "--config",
-        default=CONFIG_PATH_DEFAULT,
-        help=f"Path to pod config JSON (default: {CONFIG_PATH_DEFAULT})",
-    )
-    parser.add_argument(
-        "--name",
-        default=None,
-        help="Override the pod name from config JSON",
-    )
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", required=True, help="Pod name")
+    parser.add_argument("--wait-ready", default="0", help="Seconds to wait until running")
+    parser.add_argument("--check-ports", default="false", help="true/false")
+    parser.add_argument("--idle-minutes", default="0", help="Auto-stop if idle (inform container via env)")
     args = parser.parse_args()
 
-    token = os.getenv("RUNPOD_API_KEY", "").strip()
+    token = os.environ.get("RUNPOD_API_KEY", "").strip()
     if not token:
-        eprint("RUNPOD_API_KEY is required in environment.")
-        return 2
+        log("ERROR: RUNPOD_API_KEY env var is required")
+        return 1
 
-    # Load config
-    cfg = load_pod_config(args.config)
+    # Expose idle minutes to env so spec merge picks it up
+    os.environ["IDLE_MINUTES"] = str(args.idle_minutes)
 
-    # Optional override of name
-    if args.name:
-        cfg["name"] = args.name
-
-    # A little debugging block like in your workflow step:
-    print("##[group]Run set -x")
-    print("set -x")
-    print("ls -la infra/runpod || true")
-    print("wc -c infra/runpod/pod_config.json || true")
-    print("sed -n '1,120p' infra/runpod/pod_config.json || true")
-    print("##[endgroup]")
+    # Load base spec
+    try:
+        cfg = read_config()
+    except Exception as e:
+        log(f"ERROR reading config {CONFIG_PATH}: {e}")
+        return 1
 
     # Upsert
-    result = upsert_pod(cfg, token)
+    pod = upsert_pod(cfg, token, name=args.name)
+    pod_id = str(pod.get("id") or pod.get("_id") or "")
+    if not pod_id:
+        log(f"[launch_pod] WARNING: Could not determine pod id from response: {json.dumps(pod)[:500]}")
+    else:
+        log(f"[launch_pod] POD_ID = {pod_id}")
+        write_github_output("POD_ID", pod_id)
 
-    # Pull out an ID for GitHub Actions log consumption
-    pod_id = extract_pod_id(result)
-    name = cfg.get("name")
+    # Wait for RUNNING if requested
+    wait_secs = int(str(args.wait_ready).strip() or "0")
+    if pod_id and wait_secs > 0:
+        try:
+            pod = wait_until_running(pod_id, token, wait_secs)
+        except Exception as e:
+            log(f"[launch_pod] WARNING: wait_until_running failed: {e}")
 
-    # Emit a helpful GitHub Actions notice (consumable by later steps)
-    # Format: ::notice title=RunPod::POD_ID=...,NAME=...,REGION=...
-    region = cfg.get("regionId") or cfg.get("region") or ""
-    title = "RunPod"
-    fields = [
-        f"POD_ID={pod_id or ''}",
-        f"NAME={name or ''}",
-        f"REGION={region}",
-    ]
-    print(f"::notice title={title}::{','.join(fields)}")
+    # Port checks (best effort)
+    if parse_bool(args.check_ports):
+        # Re-fetch latest snapshot
+        if pod_id:
+            try:
+                pod = get_pod(pod_id, token)
+            except Exception:
+                pass
 
-    # Also print a concise human-readable summary
-    summary_lines = [
-        "RunPod upsert complete:",
-        f"  Name:   {name}",
-        f"  Region: {region}",
-        f"  PodID:  {pod_id or '(unknown from response)'}",
-    ]
-    print("\n".join(summary_lines))
+        host, ports = discover_host_and_ports(pod)
+        # If ports weren't discoverable from the pod detail, fall back to config file
+        if not ports:
+            try:
+                cfg_ports = cfg.get("ports", "")
+                if isinstance(cfg_ports, str):
+                    ports = [int(p.strip()) for p in cfg_ports.split(",") if p.strip().isdigit()]
+            except Exception:
+                ports = []
+
+        if not host:
+            log("[launch_pod] NOTE: Could not determine public host/IP; skipping port checks.")
+        elif not ports:
+            log("[launch_pod] NOTE: No port list found; skipping port checks.")
+        else:
+            bad = []
+            for pnum in ports:
+                ok = tcp_check(host, pnum, timeout=2.5)
+                log(f"[launch_pod] Port {pnum} on {host}: {'OPEN' if ok else 'CLOSED'}")
+                if not ok:
+                    bad.append(pnum)
+            if bad:
+                log(f"[launch_pod] WARNING: some ports appear closed: {bad}")
+
+    # Print final pod summary (truncated)
+    try:
+        summary = json.dumps(pod, indent=2) if isinstance(pod, dict) else str(pod)
+        log(f"[launch_pod] Final pod object (truncated):\n{summary[:2000]}")
+    except Exception:
+        pass
 
     return 0
 
