@@ -1,195 +1,144 @@
-#!/usr/bin/env python3
-import argparse
-import json
-import os
-import sys
-import time
-from typing import Any, Dict, Optional
+﻿#!/usr/bin/env python3
+import argparse, json, os, sys, time
+from pathlib import Path
+
 import requests
 
-# --- config / helpers ---------------------------------------------------------
+API_BASE = os.getenv("RUNPOD_API_BASE", "https://rest.runpod.io").rstrip("/")
+API_KEY = os.getenv("RUNPOD_API_KEY")
 
-RUNPOD_API_BASE = os.getenv("RUNPOD_API_BASE", "https://rest.runpod.io").rstrip("/")
-API_TIMEOUT = 30
+SESSION = requests.Session()
+SESSION.headers.update({
+    "Authorization": f"Bearer {API_KEY}" if API_KEY else "",
+    "Content-Type": "application/json",
+})
 
-def _auth_headers() -> Dict[str, str]:
-    token = os.getenv("RUNPOD_API_KEY", "").strip()
-    if not token:
-        print("[launch_pod] FATAL: RUNPOD_API_KEY is not set in env.", file=sys.stderr)
-        sys.exit(1)
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
+def _url(path: str) -> str:
+    if not path.startswith("/"):
+        path = "/" + path
+    return f"{API_BASE}/v1{path}"
 
-def _get(url: str, **kwargs) -> requests.Response:
-    r = requests.get(url, headers=_auth_headers(), timeout=API_TIMEOUT, **kwargs)
-    if r.status_code >= 400:
-        try:
-            print(f"[launch_pod] ERROR: GET {url}: {r.status_code} {r.reason}; response={r.text}")
-        except Exception:
-            print(f"[launch_pod] ERROR: GET {url}: {r.status_code} {r.reason}")
-    r.raise_for_status()
-    return r
-
-def _post(url: str, payload: Dict[str, Any]) -> requests.Response:
-    r = requests.post(url, headers=_auth_headers(), json=payload, timeout=API_TIMEOUT)
-    if r.status_code >= 400:
-        try:
-            print(f"[launch_pod] ERROR: POST {url}: {r.status_code} {r.reason}; response={r.text}")
-        except Exception:
-            print(f"[launch_pod] ERROR: POST {url}: {r.status_code} {r.reason}")
-    r.raise_for_status()
-    return r
-
-def _patch(url: str, payload: Dict[str, Any]) -> requests.Response:
-    r = requests.patch(url, headers=_auth_headers(), json=payload, timeout=API_TIMEOUT)
-    if r.status_code >= 400:
-        try:
-            print(f"[launch_pod] ERROR: PATCH {url}: {r.status_code} {r.reason}; response={r.text}")
-        except Exception:
-            print(f"[launch_pod] ERROR: PATCH {url}: {r.status_code} {r.reason}")
-    r.raise_for_status()
-    return r
-
-# --- runpod REST v1 helpers (pods) -------------------------------------------
-# NOTE: The important bit is using https://rest.runpod.io as base.
-# These paths match the v1 REST pod API commonly used by RunPod's Secure Cloud.
-
-def api_list_pods(name: Optional[str] = None) -> Dict[str, Any]:
-    url = f"{RUNPOD_API_BASE}/v1/pods"
-    params = {}
-    if name:
-        params["name"] = name
-    r = _get(url, params=params)
-    return r.json()
-
-def api_create_pod(spec: Dict[str, Any]) -> Dict[str, Any]:
-    url = f"{RUNPOD_API_BASE}/v1/pods"
-    r = _post(url, spec)
-    return r.json()
-
-def api_get_pod(pod_id: str) -> Dict[str, Any]:
-    url = f"{RUNPOD_API_BASE}/v1/pods/{pod_id}"
-    r = _get(url)
-    return r.json()
-
-def api_start_pod(pod_id: str) -> Dict[str, Any]:
-    url = f"{RUNPOD_API_BASE}/v1/pods/{pod_id}/start"
-    r = _post(url, {})
-    return r.json()
-
-def api_stop_pod(pod_id: str) -> Dict[str, Any]:
-    url = f"{RUNPOD_API_BASE}/v1/pods/{pod_id}/stop"
-    r = _post(url, {})
-    return r.json()
-
-# --- logic --------------------------------------------------------------------
-
-def load_spec(path: str) -> Dict[str, Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-def find_existing_pod(name: str) -> Optional[Dict[str, Any]]:
+def _req(method: str, path: str, **kwargs):
+    url = _url(path)
+    r = SESSION.request(method, url, timeout=60, **kwargs)
     try:
-        pods = api_list_pods(name=name)
-    except requests.HTTPError as e:
-        print(f"[launch_pod] FATAL: list pods failed: {e}", file=sys.stderr)
-        raise
-    # Expect either {"pods":[...]} or a plain list depending on API; handle both
-    items = pods.get("pods", pods if isinstance(pods, list) else [])
-    for p in items:
-        if (p.get("name") or "").strip() == name:
+        payload = r.json()
+    except Exception:
+        payload = r.text
+    if not r.ok:
+        print(f"[launch_pod] ERROR: {method} {url} -> {r.status_code}; response={payload}", file=sys.stderr)
+        r.raise_for_status()
+    return payload
+
+def list_pods():
+    page = 1
+    pods = []
+    while True:
+        data = _req("GET", "/pods", params={"page": page})
+        items = data.get("data", []) if isinstance(data, dict) else data
+        if not items:
+            break
+        pods.extend(items)
+        meta = data.get("meta") if isinstance(data, dict) else None
+        if not meta or page >= int(meta.get("totalPages", page)):
+            break
+        page += 1
+    return pods
+
+def get_pod_by_name(name: str):
+    for p in list_pods():
+        if p.get("name") == name:
             return p
     return None
 
-def wait_until_ready(pod_id: str, timeout_secs: int) -> bool:
+def get_pod(pod_id: str):
+    return _req("GET", f"/pods/{pod_id}")
+
+def create_pod_from_config(config_path: Path):
+    cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    return _req("POST", "/pods", json=cfg)
+
+def start_pod(pod_id: str):
+    return _req("POST", f"/pods/{pod_id}/start")
+
+def stop_pod(pod_id: str):
+    return _req("POST", f"/pods/{pod_id}/stop")
+
+def status_is_running(pod) -> bool:
+    st = (pod.get("desiredStatus") or pod.get("status") or "").upper()
+    return st == "RUNNING"
+
+def wait_until_running(pod_id: str, timeout_secs: int) -> dict:
     deadline = time.time() + timeout_secs
-    last_state = None
+    last = None
     while time.time() < deadline:
-        info = api_get_pod(pod_id)
-        state = (info.get("status") or info.get("state") or "").lower()
-        if state != last_state:
-            print(f"[launch_pod] pod {pod_id} state={state}")
-            last_state = state
-        if state in {"running", "ready", "started"}:
-            return True
+        last = get_pod(pod_id)
+        st = (last.get("desiredStatus") or last.get("status") or "").upper()
+        print(f"[launch_pod] waiting: {pod_id} -> {st}")
+        if status_is_running(last):
+            return last
+        if st in {"ERROR", "TERMINATED"}:
+            raise RuntimeError(f"Pod entered terminal state: {st}")
         time.sleep(5)
-    return False
+    raise TimeoutError(f"Timed out waiting for pod {pod_id} to be RUNNING")
 
-def check_ports_stub(pod: Dict[str, Any]) -> None:
-    # If you need to actively probe mapped ports, do it here (SSH/Jupyter).
-    # Keeping this as a stub to avoid false negatives during creation.
-    pass
+def main():
+    if not API_KEY:
+        print("[launch_pod] FATAL: RUNPOD_API_KEY is not set", file=sys.stderr)
+        sys.exit(1)
 
-def upsert_pod(spec: Dict[str, Any], name: str, wait_ready: int, check_ports: bool) -> Dict[str, Any]:
-    existing = find_existing_pod(name)
-    if existing:
-        pod_id = existing.get("id") or existing.get("podId") or existing.get("pod_id")
-        print(f"[launch_pod] existing pod found: {name} -> {pod_id}")
-        # ensure it's started
-        try:
-            api_start_pod(pod_id)
-        except requests.HTTPError:
-            # if already running, it's fine
-            pass
-        if wait_ready and not wait_until_ready(pod_id, wait_ready):
-            raise SystemExit(f"[launch_pod] FATAL: pod {pod_id} did not become ready within {wait_ready}s")
-        if check_ports:
-            check_ports_stub(existing)
-        # return fresh info
-        return api_get_pod(pod_id)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--wait-ready", type=int, default=600)
+    ap.add_argument("--check-ports", type=lambda s: s.lower() in {"1","true","yes"}, default=True)
+    ap.add_argument("--config", default="infra/runpod/pod_config.json")
+    args = ap.parse_args()
 
-    print(f"[launch_pod] creating pod '{name}'")
-    created = api_create_pod(spec)
-    pod_id = created.get("id") or created.get("podId") or created.get("pod_id")
-    if not pod_id:
-        raise SystemExit(f"[launch_pod] FATAL: create returned no pod id: {created}")
-    # start (some clusters auto-start on create; calling start is safe)
-    try:
-        api_start_pod(pod_id)
-    except requests.HTTPError:
-        pass
-    if wait_ready and not wait_until_ready(pod_id, wait_ready):
-        raise SystemExit(f"[launch_pod] FATAL: pod {pod_id} did not become ready within {wait_ready}s")
-    if check_ports:
-        check_ports_stub(created)
-    return api_get_pod(pod_id)
+    print(f"[launch_pod] Using API base: {API_BASE}")
+    if API_BASE.startswith("https://api.runpod.io"):
+        print("[launch_pod] WARNING: api.runpod.io is not the REST v1 base; use https://rest.runpod.io", file=sys.stderr)
 
-# --- CLI ----------------------------------------------------------------------
+    cfg_path = Path(args.config)
+    if not cfg_path.exists():
+        print(f"[launch_pod] FATAL: config file not found: {cfg_path}", file=sys.stderr)
+        sys.exit(1)
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--name", required=True)
-    parser.add_argument("--config", default="infra/runpod/pod_config.json")
-    parser.add_argument("--wait-ready", type=int, default=600)
-    parser.add_argument("--check-ports", type=lambda s: str(s).lower() == "true", default=True)
-    parser.add_argument("--idle-minutes", type=int, default=30)  # reserved for your own use if needed
-    args = parser.parse_args()
-
-    spec = load_spec(args.config)
-    # make sure name in spec matches the provided name (source of truth is CLI)
-    spec["name"] = args.name
-
-    try:
-        pod_info = upsert_pod(spec, name=args.name, wait_ready=args.wait_ready, check_ports=args.check_ports)
-    except requests.HTTPError as e:
-        print(f"[launch_pod] FATAL: {e}", file=sys.stderr)
-        return 1
-
-    pod_id = pod_info.get("id") or pod_info.get("podId") or pod_info.get("pod_id") or ""
-    if pod_id:
-        # emit to GitHub Actions output
-        gha_out = os.environ.get("GITHUB_OUTPUT")
-        if gha_out:
-            with open(gha_out, "a", encoding="utf-8") as fh:
-                fh.write(f"POD_ID={pod_id}\n")
-        print(f"[launch_pod] POD_ID={pod_id}")
-        return 0
+    pod = get_pod_by_name(args.name)
+    if pod:
+        pid = pod["id"]
+        st = (pod.get("desiredStatus") or pod.get("status") or "").upper()
+        print(f"[launch_pod] Found existing pod: {args.name} id={pid} status={st}")
+        if st != "RUNNING":
+            print(f"[launch_pod] Starting pod {pid}…")
+            start_pod(pid)
     else:
-        print(f"[launch_pod] WARN: could not determine pod id from: {pod_info}", file=sys.stderr)
-        return 0
+        print(f"[launch_pod] Creating new pod: {args.name}")
+        created = create_pod_from_config(cfg_path)
+        pod = created.get("data") if isinstance(created, dict) and "data" in created else created
+        pid = pod["id"]
+        print(f"[launch_pod] Created pod id={pid}")
+
+    pod = wait_until_running(pid, args.wait_ready)
+
+    if args.check_ports:
+        host = pod.get("host") or pod.get("publicIp") or "(no-host)"
+        ports = pod.get("ports") or []
+        print(f"[launch_pod] Host: {host}")
+        print(f"[launch_pod] Ports: {ports}")
+
+    line = f"POD_ID={pid}"
+    print(line)
+    gh_out = os.getenv("GITHUB_OUTPUT")
+    if gh_out:
+        with open(gh_out, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        main()
+    except requests.HTTPError as e:
+        print(f"[launch_pod] FATAL: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"[launch_pod] FATAL: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -1,6 +1,7 @@
-{
+﻿{
   "name": "ari-ultimate",
   "cloudType": "SECURE",
+  "computeType": "GPU",
   "gpuTypeIds": ["NVIDIA L40"],
   "gpuCount": 1,
   "containerDiskInGb": 100,
@@ -8,6 +9,8 @@
   "volumeMountPath": "/workspace",
   "imageName": "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04",
   "ports": ["8888/http", "22/tcp"],
+  "supportPublicIp": true,
+  "globalNetworking": true,
   "env": {
     "PUBLIC_KEY": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDTP4We8uNhdHo0DODXleWjOCbG6LgikEKzMez9+s7vT ariwhispers1@gmail.com",
     "JUPYTER_PASSWORD": "b2fzhn4whpgcno0xedv4"

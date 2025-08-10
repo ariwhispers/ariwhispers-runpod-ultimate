@@ -23,8 +23,9 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
-    env:
+env:
+  RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+  RUNPOD_API_BASE: https://rest.runpod.io
       POD_NAME: ${{ github.event.inputs.pod_name }}
       WAIT_READY_SECS: ${{ github.event.inputs.wait_ready_secs }}
       CHECK_PORTS: ${{ github.event.inputs.check_ports }}
