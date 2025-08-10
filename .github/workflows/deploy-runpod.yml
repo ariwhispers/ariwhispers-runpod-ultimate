@@ -4,33 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       pod_name:
-        description: "Pod name"
+        description: "RunPod pod name"
         required: true
         default: "ari-ultimate"
       wait_ready_secs:
-        description: "Seconds to wait for RUNNING"
+        description: "Seconds to wait for readiness"
         required: false
         default: "600"
       check_ports:
-        description: "Check ports after ready (true/false)"
+        description: "Check ports after launch"
         required: false
         default: "true"
       idle_minutes:
-        description: "(kept for compat)"
+        description: "Auto-shutdown after X idle minutes"
         required: false
         default: "30"
 
 jobs:
   deploy:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:
-      contents: read
+    runs-on: ubuntu-latest
+
     env:
-      POD_NAME: ${{ inputs.pod_name }}
-      WAIT_READY_SECS: ${{ inputs.wait_ready_secs }}
-      CHECK_PORTS: ${{ inputs.check_ports }}
-      IDLE_MINUTES: ${{ inputs.idle_minutes }}
       RUNPOD_API_BASE: https://rest.runpod.io
 
     steps:
@@ -53,17 +47,35 @@ jobs:
           sed -n '1,200p' infra/runpod/pod_config.json || true
 
       - name: Launch or update pod
-        id: launch
         env:
+          POD_NAME: ${{ inputs.pod_name }}
+          WAIT_READY_SECS: ${{ inputs.wait_ready_secs }}
+          CHECK_PORTS: ${{ inputs.check_ports }}
+          IDLE_MINUTES: ${{ inputs.idle_minutes }}
+
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DOCKER_ACCESS_TOKEN: ${{ secrets.DOCKER_ACCESS_TOKEN }}
+          GIT_PAT: ${{ secrets.GIT_PAT }}
         run: |
           set -euo pipefail
-          echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS})…"
-          # Your script must write:  echo "POD_ID=xxxx" >> "$GITHUB_OUTPUT"
+          echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS}, idle=${IDLE_MINUTES}m)…"
           python infra/runpod/launch_pod.py \
             --name "${POD_NAME}" \
             --wait-ready "${WAIT_READY_SECS}" \
-            --check-ports "${CHECK_PORTS}"
+            --check-ports "${CHECK_PORTS}" \
+            --idle-minutes "${IDLE_MINUTES}"
 
       - name: Show POD_ID
-        run: echo "POD_ID: ${{ steps.launch.outputs.POD_ID }}"
+        shell: bash
+        run: |
+          echo "POD_ID from previous step (if set):"
+          if [[ -f "$GITHUB_OUTPUT" ]]; then
+            grep -E '^POD_ID=' "$GITHUB_OUTPUT" || true
+          else
+            echo "(no GITHUB_OUTPUT file present)"
+          fi
