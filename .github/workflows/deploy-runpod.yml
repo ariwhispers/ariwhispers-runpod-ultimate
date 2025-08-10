@@ -15,10 +15,6 @@ on:
         description: "Check ports after launch"
         required: false
         default: "true"
-      idle_minutes:
-        description: "Unused (kept for UI compat)"
-        required: false
-        default: "30"
 
 jobs:
   deploy:
@@ -26,7 +22,6 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-
     env:
       RUNPOD_API_BASE: https://rest.runpod.io
 
@@ -67,7 +62,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS})…"
-          # Your script should: echo "POD_ID=xxxx" >> "$GITHUB_OUTPUT"
+          # Should emit:  echo "POD_ID=xxxx" >> "$GITHUB_OUTPUT"
           python infra/runpod/launch_pod.py \
             --name "${POD_NAME}" \
             --wait-ready "${WAIT_READY_SECS}" \
