@@ -20,7 +20,34 @@ jobs:
   deploy:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    permissions:
+    permissions:name: Deploy to RunPod
+
+on:
+  workflow_dispatch:
+    inputs:
+      pod_name:
+        description: "RunPod pod name"
+        required: true
+        type: string
+      wait_ready_secs:
+        description: "Seconds to wait for pod readiness"
+        required: true
+        default: "600"
+        type: string
+      check_ports:
+        description: "Check exposed ports"
+        required: false
+        default: "true"
+        type: boolean
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      # rest of your steps...
+
       contents: read
     env:
       RUNPOD_API_BASE: https://rest.runpod.io
