@@ -1,1 +1,69 @@
-﻿
+﻿name: deploy-runpod
+
+on:
+  workflow_dispatch:
+    inputs:
+      pod_name:
+        description: "Pod name"
+        required: true
+        default: "ari-ultimate"
+      wait_ready_secs:
+        description: "Seconds to wait for RUNNING"
+        required: false
+        default: "600"
+      check_ports:
+        description: "Check ports after ready (true/false)"
+        required: false
+        default: "true"
+      idle_minutes:
+        description: "(kept for compat)"
+        required: false
+        default: "30"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      POD_NAME: ${{ inputs.pod_name }}
+      WAIT_READY_SECS: ${{ inputs.wait_ready_secs }}
+      CHECK_PORTS: ${{ inputs.check_ports }}
+      IDLE_MINUTES: ${{ inputs.idle_minutes }}
+      RUNPOD_API_BASE: https://rest.runpod.io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Debug pod_config.json
+        run: |
+          set -x
+          ls -la infra/runpod || true
+          wc -c infra/runpod/pod_config.json || true
+          sed -n '1,200p' infra/runpod/pod_config.json || true
+
+      - name: Launch or update pod
+        id: launch
+        env:
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS})…"
+          # Your script must write:  echo "POD_ID=xxxx" >> "$GITHUB_OUTPUT"
+          python infra/runpod/launch_pod.py \
+            --name "${POD_NAME}" \
+            --wait-ready "${WAIT_READY_SECS}" \
+            --check-ports "${CHECK_PORTS}"
+
+      - name: Show POD_ID
+        run: echo "POD_ID: ${{ steps.launch.outputs.POD_ID }}"
