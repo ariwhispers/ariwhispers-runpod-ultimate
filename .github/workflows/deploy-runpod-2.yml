@@ -1,68 +1,36 @@
-﻿name: deploy-runpod
+# 1) Replace the workflow with a clean, minimal version
+$y = @'
+name: deploy-runpod-2
 
 on:
   workflow_dispatch:
     inputs:
       pod_name:
-        description: "RunPod pod name"
+        description: RunPod pod name
         required: true
-        default: "ari-ultimate"
+        default: ari-ultimate
       wait_ready_secs:
-        description: "Seconds to wait for readiness"
+        description: Seconds to wait for readiness
         required: false
         default: "600"
       check_ports:
-        description: "Check ports after launch"
+        description: Check ports after launch
         required: false
         default: "true"
 
 jobs:
   deploy:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    permissions:name: Deploy to RunPod
-
-on:
-  workflow_dispatch:
-    inputs:
-      pod_name:
-        description: "RunPod pod name"
-        required: true
-        type: string
-      wait_ready_secs:
-        description: "Seconds to wait for pod readiness"
-        required: true
-        default: "600"
-        type: string
-      check_ports:
-        description: "Check exposed ports"
-        required: false
-        default: "true"
-        type: boolean
-
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      # rest of your steps...
-
+    permissions:
       contents: read
     env:
       RUNPOD_API_BASE: https://rest.runpod.io
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
-      - name: Install deps
-        run: pip install -r requirements.txt
+      - run: pip install -r requirements.txt
 
       - name: Debug pod_config.json
         run: |
@@ -77,19 +45,10 @@ jobs:
           POD_NAME: ${{ inputs.pod_name }}
           WAIT_READY_SECS: ${{ inputs.wait_ready_secs }}
           CHECK_PORTS: ${{ inputs.check_ports }}
-
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
-          HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
-          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DOCKER_ACCESS_TOKEN: ${{ secrets.DOCKER_ACCESS_TOKEN }}
-          GIT_PAT: ${{ secrets.GIT_PAT }}
         run: |
           set -euo pipefail
           echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS})…"
-          # Should emit:  echo "POD_ID=xxxx" >> "$GITHUB_OUTPUT"
           python infra/runpod/launch_pod.py \
             --name "${POD_NAME}" \
             --wait-ready "${WAIT_READY_SECS}" \
@@ -97,3 +56,14 @@ jobs:
 
       - name: Show POD_ID
         run: echo "POD_ID: ${{ steps.launch.outputs.POD_ID }}"
+'@
+
+# 2) Save as UTF-8 (no BOM) + LF
+$enc = New-Object System.Text.UTF8Encoding($false)
+$lf  = $y -replace "`r?`n","`n"
+[IO.File]::WriteAllText(".github/workflows/deploy-runpod-2.yml", $lf, $enc)
+
+# 3) Commit & push
+git add .github/workflows/deploy-runpod-2.yml
+git commit -m "ci: replace deploy-runpod-2 with valid YAML (UTF-8 no BOM + LF)"
+git push
