@@ -1,353 +1,208 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Launch or update a RunPod pod (best-effort upsert by name), optionally wait
-until it's running, optionally check exposed ports, and emit POD_ID for workflows.
-
-This script is defensive: RunPod's v2 REST surface may differ by account/region.
-We try name-lookup first; if the API returns 404 for list/search endpoints,
-we fall back to creation. If creation conflicts (name already exists), we try
-to discover the pod ID via other endpoints before giving up.
-
-Environment:
-  RUNPOD_API_KEY      (required)
-  RUNPOD_API_BASE     (optional, default: https://api.runpod.io)
-  GITHUB_OUTPUT       (GitHub Actions sets this; used to emit POD_ID)
-
-CLI:
-  --name NAME
-  --wait-ready SECONDS         (default: 0 -> don't wait)
-  --check-ports true|false     (default: false)
-  --idle-minutes MINUTES       (default: 0 -> disabled)
-
-Config file:
-  infra/runpod/pod_config.json  (base pod spec; we inject/override .name and may
-                                append env vars / hints like IDLE_MINUTES)
-"""
-from __future__ import annotations
-
 import argparse
 import json
 import os
 import sys
 import time
-import socket
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
-CONFIG_PATH = os.path.join(HERE, "pod_config.json")
 
-DEFAULT_API_BASE = os.environ.get("RUNPOD_API_BASE", "https://api.runpod.io").rstrip("/")
-API_TIMEOUT = 30
-SESSION = requests.Session()
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
 
-def log(msg: str) -> None:
-    print(msg, flush=True)
+def get_base_url() -> str:
+    # Use REST base by default
+    return os.environ.get("RUNPOD_API_BASE", "https://rest.runpod.io").rstrip("/")
 
 
-def debug(errprefix: str, e: requests.RequestException, resp: Optional[requests.Response]) -> None:
-    try:
-        body = resp.json() if resp is not None else None
-    except Exception:
-        body = resp.text if resp is not None else None
-    log(f"[launch_pod] {errprefix}: {str(e)}; response={body}")
+def get_headers() -> Dict[str, str]:
+    api_key = os.environ.get("RUNPOD_API_KEY")
+    if not api_key:
+        raise RuntimeError("RUNPOD_API_KEY is required (set it as a GitHub Actions secret).")
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
 
 
-def api(method: str, path: str, token: str, **kwargs) -> requests.Response:
-    url = f"{DEFAULT_API_BASE}{path}"
-    headers = kwargs.pop("headers", {})
-    headers["Authorization"] = f"Bearer {token}"
-    headers["Content-Type"] = "application/json"
-    # Don't let requests print secrets on error
-    kwargs.setdefault("timeout", API_TIMEOUT)
-    return SESSION.request(method, url, headers=headers, **kwargs)
+# -------------------------
+# REST API helpers (/v1/pods)
+# -------------------------
 
-
-def read_config() -> Dict[str, Any]:
-    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-        # Guard against BOM
-        raw = f.read().lstrip("\ufeff")
-        return json.loads(raw)
-
-
-def merge_env(cfg_env: Dict[str, str], extras: Dict[str, str]) -> Dict[str, str]:
-    out = dict(cfg_env or {})
-    for k, v in extras.items():
-        if v is None or v == "":
-            continue
-        out[k] = v
-    return out
-
-
-def find_pod_by_name(name: str, token: str) -> Optional[Dict[str, Any]]:
-    """
-    Best-effort search by name.
-    Different accounts may not have a 'GET /v2/pods' or '/v2/pods?name=…'.
-    We try a couple of patterns; any 404s are tolerated.
-    """
-    try_paths = [
-        f"/v2/pods?name={name}",
-        "/v2/pods",  # if supported, filter client-side
-    ]
-    for p in try_paths:
-        try:
-            r = api("GET", p, token)
-            if r.status_code == 404:
-                # Endpoint not available in this account/plan — try next
-                log(f"[launch_pod] NOTE: {p} returned 404; trying alternate lookup.")
-                continue
-            r.raise_for_status()
-            data = r.json()
-            # data might be a list or an object with 'data' key depending on API surface
-            pods = []
-            if isinstance(data, list):
-                pods = data
-            elif isinstance(data, dict):
-                if "data" in data and isinstance(data["data"], list):
-                    pods = data["data"]
-                elif "pods" in data and isinstance(data["pods"], list):
-                    pods = data["pods"]
-            for pod in pods:
-                if str(pod.get("name", "")).strip().lower() == name.strip().lower():
-                    return pod
-        except requests.RequestException as e:
-            debug(f"ERROR: GET {p}", e, resp=getattr(e, "response", None))
-            # Continue trying alternatives
-            continue
-    return None
-
-
-def create_pod(spec: Dict[str, Any], token: str) -> Dict[str, Any]:
-    r = api("POST", "/v2/pods", token, json=spec)
-    if r.status_code == 404:
-        # Some tenants expose creation at /v2/pods/create
-        r = api("POST", "/v2/pods/create", token, json=spec)
+def create_pod(spec: Dict[str, Any]) -> Dict[str, Any]:
+    r = requests.post(f"{get_base_url()}/v1/pods", headers=get_headers(), data=json.dumps(spec))
+    if not r.ok:
+        eprint(f"[launch_pod] ERROR: create pod: {r.status_code} {r.reason}; response={safe_json(r)}")
     r.raise_for_status()
     return r.json()
 
 
-def get_pod(pod_id: str, token: str) -> Dict[str, Any]:
-    r = api("GET", f"/v2/pods/{pod_id}", token)
+def list_pods_by_name(name: str) -> List[Dict[str, Any]]:
+    r = requests.get(f"{get_base_url()}/v1/pods", headers=get_headers(), params={"name": name})
+    if not r.ok:
+        eprint(f"[launch_pod] ERROR: list pods: {r.status_code} {r.reason}; response={safe_json(r)}")
+    r.raise_for_status()
+    data = r.json()
+    return data.get("pods", []) if isinstance(data, dict) else []
+
+
+def get_pod(pod_id: str) -> Dict[str, Any]:
+    r = requests.get(f"{get_base_url()}/v1/pods/{pod_id}", headers=get_headers())
+    if not r.ok:
+        eprint(f"[launch_pod] ERROR: get pod: {r.status_code} {r.reason}; response={safe_json(r)}")
     r.raise_for_status()
     return r.json()
 
 
-def update_pod(pod_id: str, spec: Dict[str, Any], token: str) -> Dict[str, Any]:
-    # Some surfaces use PATCH, others PUT — try PATCH then PUT.
-    r = api("PATCH", f"/v2/pods/{pod_id}", token, json=spec)
-    if r.status_code in (404, 405):
-        r = api("PUT", f"/v2/pods/{pod_id}", token, json=spec)
+def start_pod(pod_id: str) -> Dict[str, Any]:
+    r = requests.post(f"{get_base_url()}/v1/pods/{pod_id}/start", headers=get_headers())
+    if not r.ok:
+        eprint(f"[launch_pod] ERROR: start pod: {r.status_code} {r.reason}; response={safe_json(r)}")
     r.raise_for_status()
     return r.json()
 
 
-def wait_until_running(pod_id: str, token: str, timeout_secs: int) -> Dict[str, Any]:
-    if timeout_secs <= 0:
-        return get_pod(pod_id, token)
+def stop_pod(pod_id: str) -> Dict[str, Any]:
+    r = requests.post(f"{get_base_url()}/v1/pods/{pod_id}/stop", headers=get_headers())
+    if not r.ok:
+        eprint(f"[launch_pod] ERROR: stop pod: {r.status_code} {r.reason}; response={safe_json(r)}")
+    r.raise_for_status()
+    return r.json()
+
+
+def update_pod_autostop(pod_id: str, idle_minutes: int) -> None:
+    # Not all accounts/regions support patching runtime config via REST.
+    # If unsupported, this will be a no-op with a warning.
+    payload = {"idleTimeout": idle_minutes}  # documented as minutes in most setups
+    r = requests.patch(f"{get_base_url()}/v1/pods/{pod_id}", headers=get_headers(), data=json.dumps(payload))
+    if r.status_code == 404 or r.status_code == 400:
+        eprint(f"[launch_pod] WARN: setting idle timeout may be unsupported: {r.status_code} {r.reason}; response={safe_json(r)}")
+        return
+    if not r.ok:
+        eprint(f"[launch_pod] WARN: failed to set idle timeout: {r.status_code} {r.reason}; response={safe_json(r)}")
+        return
+    eprint(f"[launch_pod] Set idle timeout to {idle_minutes} minutes.")
+
+
+# -------------------------
+# Orchestration
+# -------------------------
+
+def upsert_pod(spec: Dict[str, Any], name: str) -> Dict[str, Any]:
+    pods = list_pods_by_name(name)
+    if pods:
+        pod = pods[0]
+        eprint(f"[launch_pod] Found existing pod '{name}' (id={pod.get('id')})")
+        return pod
+    eprint(f"[launch_pod] Creating pod '{name}' (no existing match found)")
+    return create_pod(spec)
+
+
+def wait_until_ready(pod_id: str, timeout_secs: int) -> Dict[str, Any]:
     deadline = time.time() + timeout_secs
-    last_state = ""
+    last_status = None
     while time.time() < deadline:
-        pod = get_pod(pod_id, token)
-        # Common shapes: { status: { phase: "RUNNING" } } OR { state: "RUNNING" }
-        phase = (
-            pod.get("status", {}).get("phase")
+        pod = get_pod(pod_id)
+        status = (
+            pod.get("runtime", {}).get("state")
             or pod.get("status")
             or pod.get("state")
-            or ""
         )
-        phase_str = str(phase).upper()
-        if phase_str != last_state:
-            log(f"[launch_pod] pod {pod_id} state: {phase_str}")
-            last_state = phase_str
-        if phase_str in ("RUNNING", "READY", "HEALTHY"):
+        if status != last_status:
+            eprint(f"[launch_pod] status={status}")
+            last_status = status
+        if status in ("RUNNING", "READY"):
             return pod
         time.sleep(5)
-    raise TimeoutError(f"Timed out waiting for pod {pod_id} to become RUNNING after {timeout_secs}s")
+    raise TimeoutError(f"Pod {pod_id} not ready within {timeout_secs}s")
 
 
-def tcp_check(host: str, port: int, timeout: float = 3.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
-def discover_host_and_ports(pod: Dict[str, Any]) -> tuple[Optional[str], list[int]]:
+def check_http_tcp(pod: Dict[str, Any]) -> None:
     """
-    Do best-effort discovery. Depending on account, the public address may be under:
-      pod["publicIp"], pod["status"]["network"]["publicIp"], pod["proxy"]["host"], etc.
-    Ports list can come from config "ports" (comma string) — we fall back to that.
+    Best-effort: print the public endpoints if present.
+    Different clusters expose different shapes; we won't fail the job if absent.
     """
-    host_candidates = [
-        pod.get("publicIp"),
-        pod.get("public_ip"),
-        pod.get("proxy", {}).get("host") if isinstance(pod.get("proxy"), dict) else None,
-        pod.get("status", {}).get("network", {}).get("publicIp")
-        if isinstance(pod.get("status"), dict)
-        else None,
-    ]
-    host = next((h for h in host_candidates if h), None)
-
-    ports: list[int] = []
-    # Try to find ports array in pod detail
-    if "ports" in pod and isinstance(pod["ports"], list):
-        try:
-            ports = [int(p) for p in pod["ports"]]
-        except Exception:
-            pass
-    return host, ports
-
-
-def upsert_pod(cfg: Dict[str, Any], token: str, name: str) -> Dict[str, Any]:
-    """
-    Upsert strategy:
-      1) Try to find by name; if found, send update (PATCH/PUT) with new spec.
-      2) If not found or listing not supported, try create.
-      3) If create conflicts because name exists, attempt another lookup path.
-    """
-    # Ensure name in spec
-    spec = dict(cfg)
-    spec["name"] = name
-
-    # Inject IDLE_MINUTES as an env to your container (your entrypoint can implement it)
-    env = spec.get("env", {})
-    env = merge_env(env, {"IDLE_MINUTES": os.environ.get("IDLE_MINUTES", "")})
-    spec["env"] = env
-
-    found = find_pod_by_name(name, token)
-    if found and "id" in found:
-        pod_id = str(found["id"])
-        log(f"[launch_pod] Updating existing pod '{name}' (id={pod_id})")
-        updated = update_pod(pod_id, spec, token)
-        updated["id"] = updated.get("id", pod_id)  # keep id
-        return updated
-
-    log(f"[launch_pod] Creating pod '{name}' (no existing match found)")
-    try:
-        created = create_pod(spec, token)
-        # Some responses wrap the pod; try to normalize
-        pod_obj = created.get("pod") if isinstance(created, dict) else None
-        if isinstance(pod_obj, dict) and "id" in pod_obj:
-            return pod_obj
-        return created
-    except requests.HTTPError as e:
-        resp = getattr(e, "response", None)
-        status = resp.status_code if resp is not None else None
-        text = ""
-        try:
-            text = resp.text if resp is not None else ""
-        except Exception:
-            pass
-        if status == 409 or ("exists" in text.lower() if text else False):
-            log(f"[launch_pod] Create reported conflict; trying to re-discover existing pod by name.")
-            existing = find_pod_by_name(name, token)
-            if existing:
-                return existing
-        debug("ERROR: create pod", e, resp)
-        raise
-
-
-def write_github_output(key: str, value: str) -> None:
-    path = os.environ.get("GITHUB_OUTPUT")
-    if not path:
-        # Fallback to print if not in Actions
-        log(f"{key}={value}")
-        return
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{key}={value}\n")
-
-
-def parse_bool(v: str) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--name", required=True, help="Pod name")
-    parser.add_argument("--wait-ready", default="0", help="Seconds to wait until running")
-    parser.add_argument("--check-ports", default="false", help="true/false")
-    parser.add_argument("--idle-minutes", default="0", help="Auto-stop if idle (inform container via env)")
-    args = parser.parse_args()
-
-    token = os.environ.get("RUNPOD_API_KEY", "").strip()
-    if not token:
-        log("ERROR: RUNPOD_API_KEY env var is required")
-        return 1
-
-    # Expose idle minutes to env so spec merge picks it up
-    os.environ["IDLE_MINUTES"] = str(args.idle_minutes)
-
-    # Load base spec
-    try:
-        cfg = read_config()
-    except Exception as e:
-        log(f"ERROR reading config {CONFIG_PATH}: {e}")
-        return 1
-
-    # Upsert
-    pod = upsert_pod(cfg, token, name=args.name)
-    pod_id = str(pod.get("id") or pod.get("_id") or "")
-    if not pod_id:
-        log(f"[launch_pod] WARNING: Could not determine pod id from response: {json.dumps(pod)[:500]}")
+    net = pod.get("network") or pod.get("runtime", {}).get("network", {})
+    pub_ip = net.get("publicIp") or pod.get("publicIp")
+    endpoints = net.get("endpoints") or []
+    if pub_ip:
+        eprint(f"[launch_pod] publicIp: {pub_ip}")
+    if endpoints:
+        eprint(f"[launch_pod] endpoints: {json.dumps(endpoints, indent=2)}")
     else:
-        log(f"[launch_pod] POD_ID = {pod_id}")
-        write_github_output("POD_ID", pod_id)
+        eprint("[launch_pod] NOTE: No endpoints field present; skipping port checks.")
 
-    # Wait for RUNNING if requested
-    wait_secs = int(str(args.wait_ready).strip() or "0")
-    if pod_id and wait_secs > 0:
-        try:
-            pod = wait_until_running(pod_id, token, wait_secs)
-        except Exception as e:
-            log(f"[launch_pod] WARNING: wait_until_running failed: {e}")
 
-    # Port checks (best effort)
-    if parse_bool(args.check_ports):
-        # Re-fetch latest snapshot
-        if pod_id:
-            try:
-                pod = get_pod(pod_id, token)
-            except Exception:
-                pass
-
-        host, ports = discover_host_and_ports(pod)
-        # If ports weren't discoverable from the pod detail, fall back to config file
-        if not ports:
-            try:
-                cfg_ports = cfg.get("ports", "")
-                if isinstance(cfg_ports, str):
-                    ports = [int(p.strip()) for p in cfg_ports.split(",") if p.strip().isdigit()]
-            except Exception:
-                ports = []
-
-        if not host:
-            log("[launch_pod] NOTE: Could not determine public host/IP; skipping port checks.")
-        elif not ports:
-            log("[launch_pod] NOTE: No port list found; skipping port checks.")
-        else:
-            bad = []
-            for pnum in ports:
-                ok = tcp_check(host, pnum, timeout=2.5)
-                log(f"[launch_pod] Port {pnum} on {host}: {'OPEN' if ok else 'CLOSED'}")
-                if not ok:
-                    bad.append(pnum)
-            if bad:
-                log(f"[launch_pod] WARNING: some ports appear closed: {bad}")
-
-    # Print final pod summary (truncated)
+def safe_json(r: requests.Response) -> str:
     try:
-        summary = json.dumps(pod, indent=2) if isinstance(pod, dict) else str(pod)
-        log(f"[launch_pod] Final pod object (truncated):\n{summary[:2000]}")
+        return json.dumps(r.json(), indent=2)
     except Exception:
-        pass
+        return r.text
 
-    return 0
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Create or reuse a RunPod pod via REST.")
+    p.add_argument("--name", required=True, help="Pod name to create or reuse")
+    p.add_argument("--wait-ready", type=int, default=600, help="Seconds to wait for RUNNING/READY")
+    p.add_argument("--check-ports", type=str, default="true", help="true/false")
+    p.add_argument("--idle-minutes", type=int, default=30, help="Auto-stop after idle minutes (0 to skip)")
+    p.add_argument("--config", default="infra/runpod/pod_config.json", help="Path to pod spec JSON")
+    return p.parse_args()
+
+
+def load_spec(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        spec = json.load(f)
+    # ensure the spec name matches --name (CLI is source of truth)
+    spec["name"] = args.name
+    return spec
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        args = parse_args()
+        spec = load_spec(args.config)
+
+        # Basic validation on ports shape for REST
+        ports = spec.get("ports", [])
+        if isinstance(ports, str):
+            raise RuntimeError("pod_config.json: 'ports' must be an array like ['8888/http','22/tcp'] for REST.")
+        http_ports = [p for p in ports if p.endswith("/http")]
+        tcp_ports = [p for p in ports if p.endswith("/tcp")]
+        if len(http_ports) > 1 or len(tcp_ports) > 1:
+            eprint("[launch_pod] WARN: REST allows at most 1 HTTP and 1 TCP port; extra entries may be ignored by the platform.")
+
+        # Upsert pod
+        pod = upsert_pod(spec, args.name)
+        pod_id = pod.get("id") or pod.get("podId") or pod.get("podID")
+        if not pod_id:
+            raise RuntimeError(f"Could not determine pod id from: {json.dumps(pod)}")
+
+        # Start (if stopped)
+        status = (pod.get("runtime", {}) or {}).get("state") or pod.get("status")
+        if status in ("STOPPED", "STOPPING", "PAUSED"):
+            eprint(f"[launch_pod] Pod is {status}; starting…")
+            start_pod(pod_id)
+
+        # Set idle timeout if requested
+        if args.idle_minutes and args.idle_minutes > 0:
+            update_pod_autostop(pod_id, args.idle_minutes)
+
+        # Wait until ready
+        if args.wait_ready and args.wait_ready > 0:
+            pod = wait_until_ready(pod_id, args.wait_ready)
+
+        # Optionally print endpoints
+        check_ports_flag = str(args.check_ports).strip().lower() in ("1", "true", "yes", "y")
+        if check_ports_flag:
+            check_http_tcp(pod)
+
+        # Emit POD_ID=... (the workflow step will scrape this into GITHUB_OUTPUT)
+        print(f"POD_ID={pod_id}")
+
+    except Exception as ex:
+        eprint(f"[launch_pod] FATAL: {ex}")
+        sys.exit(1)
