@@ -16,13 +16,16 @@ on:
         required: false
         default: "true"
       idle_minutes:
-        description: "Auto-shutdown after X idle minutes"
+        description: "Unused (kept for UI compat)"
         required: false
         default: "30"
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
 
     env:
       RUNPOD_API_BASE: https://rest.runpod.io
@@ -47,11 +50,11 @@ jobs:
           sed -n '1,200p' infra/runpod/pod_config.json || true
 
       - name: Launch or update pod
+        id: launch
         env:
           POD_NAME: ${{ inputs.pod_name }}
           WAIT_READY_SECS: ${{ inputs.wait_ready_secs }}
           CHECK_PORTS: ${{ inputs.check_ports }}
-          IDLE_MINUTES: ${{ inputs.idle_minutes }}
 
           RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
           HUGGINGFACE_TOKEN: ${{ secrets.HUGGINGFACE_TOKEN }}
@@ -63,19 +66,12 @@ jobs:
           GIT_PAT: ${{ secrets.GIT_PAT }}
         run: |
           set -euo pipefail
-          echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS}, idle=${IDLE_MINUTES}m)…"
+          echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS})…"
+          # Your script should: echo "POD_ID=xxxx" >> "$GITHUB_OUTPUT"
           python infra/runpod/launch_pod.py \
             --name "${POD_NAME}" \
             --wait-ready "${WAIT_READY_SECS}" \
-            --check-ports "${CHECK_PORTS}" \
-            --idle-minutes "${IDLE_MINUTES}"
+            --check-ports "${CHECK_PORTS}"
 
       - name: Show POD_ID
-        shell: bash
-        run: |
-          echo "POD_ID from previous step (if set):"
-          if [[ -f "$GITHUB_OUTPUT" ]]; then
-            grep -E '^POD_ID=' "$GITHUB_OUTPUT" || true
-          else
-            echo "(no GITHUB_OUTPUT file present)"
-          fi
+        run: echo "POD_ID: ${{ steps.launch.outputs.POD_ID }}"
