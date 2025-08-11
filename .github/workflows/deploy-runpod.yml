@@ -1,0 +1,56 @@
+name: deploy-runpod
+
+on:
+  workflow_dispatch:
+    inputs:
+      pod_name:
+        description: RunPod pod name
+        required: true
+        default: ari-ultimate
+      wait_ready_secs:
+        description: Seconds to wait for readiness
+        required: false
+        default: "600"
+      check_ports:
+        description: Check ports after launch
+        required: false
+        default: "true"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      RUNPOD_API_BASE: https://rest.runpod.io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+
+      - name: Debug pod_config.json
+        run: |
+          set -x
+          ls -la infra/runpod || true
+          wc -c infra/runpod/pod_config.json || true
+          sed -n '1,200p' infra/runpod/pod_config.json || true
+
+      - name: Launch or update pod
+        id: launch
+        env:
+          POD_NAME: ${{ inputs.pod_name }}
+          WAIT_READY_SECS: ${{ inputs.wait_ready_secs }}
+          CHECK_PORTS: ${{ inputs.check_ports }}
+          RUNPOD_API_KEY: ${{ secrets.RUNPOD_API_KEY }}
+        run: |
+          set -euo pipefail
+          echo "Launching pod '${POD_NAME}' (wait=${WAIT_READY_SECS}s, check_ports=${CHECK_PORTS})…"
+          python infra/runpod/launch_pod.py \
+            --name "${POD_NAME}" \
+            --wait-ready "${WAIT_READY_SECS}" \
+            --check-ports "${CHECK_PORTS}"
+
+      - name: Show POD_ID
+        run: echo "POD_ID: ${{ steps.launch.outputs.POD_ID }}"
